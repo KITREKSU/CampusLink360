@@ -4,8 +4,7 @@ export default function CanteenScannerPage() {
   return (
     <ScannerDisplay
       scanner="Canteen"
-      databasePath="Canteen"
-      description="Canteen scanning only. Enter amount at Canteen/Amount and wait for cards at Canteen/UID."
+      description="Canteen scanning only. Enter amount at Scanner/Canteen/Amount and wait for cards at Scanner/Canteen/UID."
     />
   );
 }
