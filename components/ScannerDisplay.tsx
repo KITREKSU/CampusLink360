@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, CheckCircle2, Loader2, RotateCcw, ScanLine, WifiOff } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Ban, CheckCircle2, Loader2, RotateCcw, ScanLine, WifiOff } from "lucide-react";
 import { child, onValue, ref, set } from "firebase/database";
 import { doc, getDoc, runTransaction } from "firebase/firestore";
 import { AppHeader } from "@/components/AppHeader";
@@ -28,24 +28,27 @@ type PaymentResult = {
 type ScannerDisplayProps = {
   scanner: ScannerType;
   description: string;
+  databasePath?: string;
 };
 
 function normalizeFeePending(value: unknown) {
   return value === 1 || value === "1" || value === true;
 }
 
-export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
+export function ScannerDisplay({ scanner, description, databasePath }: ScannerDisplayProps) {
   const isCanteenScanner = scanner === "Canteen";
   const [busy, setBusy] = useState<number>(0);
   const [uid, setUid] = useState<string>("0");
   const [student, setStudent] = useState<StudentDetails | null>(null);
   const [amount, setAmount] = useState("");
+  const [paymentStage, setPaymentStage] = useState<"amount" | "scan">("amount");
   const [paymentResult, setPaymentResult] = useState<PaymentResult | null>(null);
   const [processedUid, setProcessedUid] = useState("");
   const [status, setStatus] = useState("Waiting for scan");
   const [isLoadingStudent, setIsLoadingStudent] = useState(false);
   const [error, setError] = useState("");
-  const scannerPath = useMemo(() => `Scanner/${scanner}`, [scanner]);
+  const preserveNextIdleState = useRef(false);
+  const scannerPath = useMemo(() => databasePath ?? `Scanner/${scanner}`, [databasePath, scanner]);
   const paymentAmount = Number(amount);
   const hasValidAmount = Number.isFinite(paymentAmount) && paymentAmount > 0;
 
@@ -53,11 +56,14 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     setStudent(null);
     setUid("0");
     setBusy(0);
+    setPaymentStage("amount");
     setPaymentResult(null);
     setProcessedUid("");
     setError("");
-    setStatus(isCanteenScanner ? "Enter amount, then scan card" : "Waiting for scan");
+    setStatus(isCanteenScanner ? "Enter amount and tap Pay Now" : "Waiting for scan");
+  }, [isCanteenScanner, scannerPath]);
 
+  useEffect(() => {
     if (!realtimeDb || !isFirebaseConfigured) {
       setError("Firebase is not configured yet. Add your project values to .env.local and restart localhost.");
       return;
@@ -67,23 +73,38 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     const unsubscribe = onValue(
       scannerRef,
       (snapshot) => {
-        const value = snapshot.val() as { Busy?: number | string | boolean; UID?: string | number } | null;
+        const value = snapshot.val() as { Amount?: number | string; Busy?: number | string | boolean; UID?: string | number } | null;
         const currentBusy = Number(value?.Busy ?? 0);
         const currentUid = String(value?.UID ?? "0");
+        const currentAmount = String(value?.Amount ?? "0");
 
         setBusy(currentBusy);
         setUid(currentUid);
         setError("");
 
+        if (isCanteenScanner && paymentStage === "scan" && currentAmount !== amount) {
+          setAmount(currentAmount === "0" ? "" : currentAmount);
+        }
+
         if (currentBusy === 0) {
+          if (preserveNextIdleState.current) {
+            preserveNextIdleState.current = false;
+            return;
+          }
+
           setStudent(null);
           setPaymentResult(null);
           setProcessedUid("");
-          setStatus(isCanteenScanner ? "Enter amount, then scan card" : "Please scan your card");
+          setStatus(isCanteenScanner && paymentStage === "amount" ? "Enter amount and tap Pay Now" : "Please scan your card");
           return;
         }
 
         if (currentBusy === 1 && currentUid && currentUid !== "0") {
+          if (isCanteenScanner && paymentStage !== "scan") {
+            setStatus("Tap Pay Now before scanning card");
+            return;
+          }
+
           if (isCanteenScanner && !hasValidAmount) {
             setStatus("Enter amount before scanning card");
             return;
@@ -102,11 +123,67 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     );
 
     return () => unsubscribe();
-  }, [hasValidAmount, isCanteenScanner, scannerPath]);
+  }, [amount, hasValidAmount, isCanteenScanner, paymentStage, scannerPath]);
+
+  async function updateCanteenAmount(nextAmount: string) {
+    setAmount(nextAmount);
+    setPaymentResult(null);
+    setStudent(null);
+    setProcessedUid("");
+    setStatus("Enter amount and tap Pay Now");
+  }
+
+  async function startCanteenPayment() {
+    if (!realtimeDb || !isCanteenScanner) {
+      return;
+    }
+
+    if (!hasValidAmount) {
+      setStatus("Enter a valid amount");
+      return;
+    }
+
+    setError("");
+    setStatus("Preparing scanner...");
+
+    try {
+      const scannerRef = ref(realtimeDb);
+      await Promise.all([
+        set(child(scannerRef, `${scannerPath}/Amount`), paymentAmount),
+        set(child(scannerRef, `${scannerPath}/Busy`), 0),
+        set(child(scannerRef, `${scannerPath}/UID`), 0),
+      ]);
+      setPaymentStage("scan");
+      setStatus("Please scan your card");
+    } catch (amountError) {
+      setError(amountError instanceof Error ? amountError.message : "Unable to start payment");
+      setStatus("Unable to start payment");
+    }
+  }
+
+  async function resetScannerValues() {
+    if (!realtimeDb) {
+      throw new Error("Firebase is not configured yet.");
+    }
+
+    const scannerRef = ref(realtimeDb);
+    await Promise.all([
+      set(child(scannerRef, `${scannerPath}/Busy`), 0),
+      set(child(scannerRef, `${scannerPath}/UID`), 0),
+      ...(isCanteenScanner ? [set(child(scannerRef, `${scannerPath}/Amount`), 0)] : []),
+    ]);
+  }
 
   useEffect(() => {
     async function loadStudent() {
       if (busy !== 1 || !uid || uid === "0" || !firestoreDb || processedUid === uid) {
+        return;
+      }
+
+      if (isCanteenScanner && paymentStage !== "scan") {
+        setStudent(null);
+        setPaymentResult(null);
+        setStatus("Tap Pay Now before scanning card");
         return;
       }
 
@@ -176,6 +253,16 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
           setPaymentResult(transactionResult.payment);
           setProcessedUid(uid);
           setStatus(transactionResult.payment.message);
+
+          if (transactionResult.payment.status === "success") {
+            preserveNextIdleState.current = true;
+            await resetScannerValues();
+            setPaymentStage("amount");
+            setAmount("");
+            setUid("0");
+            setBusy(0);
+          }
+
           return;
         }
 
@@ -208,7 +295,7 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     }
 
     loadStudent();
-  }, [busy, hasValidAmount, isCanteenScanner, paymentAmount, processedUid, uid]);
+  }, [busy, hasValidAmount, isCanteenScanner, paymentAmount, paymentStage, processedUid, uid]);
 
   async function clearScanner() {
     if (!realtimeDb) {
@@ -220,17 +307,39 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     setStatus("Clearing scanner...");
 
     try {
-      const scannerRef = ref(realtimeDb);
-      await Promise.all([set(child(scannerRef, `${scannerPath}/Busy`), 0), set(child(scannerRef, `${scannerPath}/UID`), 0)]);
+      await resetScannerValues();
       setStudent(null);
       setPaymentResult(null);
       setProcessedUid("");
+      setPaymentStage("amount");
+      setAmount("");
       setUid("0");
       setBusy(0);
-      setStatus(isCanteenScanner ? "Enter amount, then scan card" : "Please scan your card");
+      setStatus(isCanteenScanner ? "Enter amount and tap Pay Now" : "Please scan your card");
     } catch (clearError) {
       setError(clearError instanceof Error ? clearError.message : "Unable to clear scanner");
       setStatus("Clear failed");
+    }
+  }
+
+  async function cancelPayment() {
+    setError("");
+    setStatus("Cancelling payment...");
+
+    try {
+      preserveNextIdleState.current = true;
+      await resetScannerValues();
+      setStudent(null);
+      setPaymentResult(null);
+      setProcessedUid("");
+      setPaymentStage("amount");
+      setAmount("");
+      setUid("0");
+      setBusy(0);
+      setStatus("Payment cancelled. Accept cash and wait for next scan.");
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : "Unable to cancel payment");
+      setStatus("Cancel failed");
     }
   }
 
@@ -255,25 +364,47 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
               min="1"
               step="1"
               value={amount}
-              onChange={(event) => {
-                setAmount(event.target.value);
-                setPaymentResult(null);
-                setStudent(null);
-                setProcessedUid("");
-                setStatus("Enter amount, then scan card");
-              }}
-              disabled={busy === 1}
+              onChange={(event) => updateCanteenAmount(event.target.value)}
+              disabled={paymentStage === "scan"}
               placeholder="Enter amount"
               className="mt-2 h-12 w-full rounded-2xl border border-cyan-100 bg-white px-4 text-lg font-black text-slate-950 outline-none focus:border-teal-400 disabled:bg-slate-100 disabled:text-slate-500"
             />
           </label>
           <p className="mt-3 text-xs font-semibold leading-5 text-slate-500">
-            Enter the canteen bill amount first. After the card scan, the amount will be deducted from
-            Student/{uid && uid !== "0" ? uid : "UID"}/Wallet.
+            Enter the canteen bill amount first, then tap Pay Now. It is saved at {scannerPath}/Amount and deducted from
+            Student/{uid && uid !== "0" ? uid : "UID"}/Wallet after card scan.
           </p>
+
+          {paymentStage === "amount" ? (
+            <button
+              type="button"
+              onClick={startCanteenPayment}
+              className="mt-5 flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-sky-950 text-sm font-black text-white shadow-lg shadow-sky-950/20 disabled:bg-slate-300"
+              disabled={!hasValidAmount}
+            >
+              Pay Now
+            </button>
+          ) : null}
+
+          {paymentResult ? (
+            <div
+              className={`mt-4 flex items-start gap-3 rounded-2xl p-4 ${
+                paymentResult.status === "success" ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"
+              }`}
+            >
+              {paymentResult.status === "success" ? <CheckCircle2 size={20} /> : <AlertTriangle size={20} />}
+              <div>
+                <p className="text-sm font-black">{paymentResult.message}</p>
+                <p className="mt-1 text-xs font-semibold opacity-80">
+                  Amount: ₹{paymentResult.amount} · Wallet balance: ₹{paymentResult.balance}
+                </p>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 
+      {!isCanteenScanner || paymentStage === "scan" ? (
       <section className="glass-panel mt-5 rounded-[28px] p-5">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -321,7 +452,7 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
           </div>
         </div>
 
-        {paymentResult ? (
+        {paymentResult && !isCanteenScanner ? (
           <div
             className={`mt-4 flex items-start gap-3 rounded-2xl p-4 ${
               paymentResult.status === "success" ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"
@@ -353,15 +484,29 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
 
         {error ? <p className="mt-4 rounded-2xl bg-red-50 p-4 text-xs font-bold leading-5 text-red-700">{error}</p> : null}
 
-        <button
-          type="button"
-          onClick={clearScanner}
-          className="mt-5 flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-sky-950 text-sm font-black text-white shadow-lg shadow-sky-950/20"
-        >
-          <RotateCcw size={17} />
-          Clear & Wait for Next Scan
-        </button>
+        <div className="mt-5 space-y-3">
+          {isCanteenScanner ? (
+            <button
+              type="button"
+              onClick={cancelPayment}
+              className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-amber-500 text-sm font-black text-white shadow-lg shadow-amber-900/20"
+            >
+              <Ban size={17} />
+              Cancel Payment & Clear
+            </button>
+          ) : null}
+
+          <button
+            type="button"
+            onClick={clearScanner}
+            className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-sky-950 text-sm font-black text-white shadow-lg shadow-sky-950/20"
+          >
+            <RotateCcw size={17} />
+            Clear & Wait for Next Scan
+          </button>
+        </div>
       </section>
+      ) : null}
     </PageContainer>
   );
 }
