@@ -75,7 +75,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
       (snapshot) => {
         const value = snapshot.val() as { Amount?: number | string; Busy?: number | string | boolean; UID?: string | number } | null;
         const currentBusy = Number(value?.Busy ?? 0);
-        const currentUid = String(value?.UID ?? "0");
+        const currentUid = String(value?.UID ?? "0").trim();
         const currentAmount = String(value?.Amount ?? "0");
 
         setBusy(currentBusy);
@@ -99,7 +99,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
           return;
         }
 
-        if (currentBusy === 1 && currentUid && currentUid !== "0") {
+        if ((currentBusy === 1 || isCanteenScanner) && currentUid && currentUid !== "0") {
           if (isCanteenScanner && paymentStage !== "scan") {
             setStatus("Tap Pay Now before scanning card");
             return;
@@ -134,10 +134,6 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
   }
 
   async function startCanteenPayment() {
-    if (!realtimeDb || !isCanteenScanner) {
-      return;
-    }
-
     if (!hasValidAmount) {
       setStatus("Enter a valid amount");
       return;
@@ -145,6 +141,13 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
 
     setError("");
     setStatus("Preparing scanner...");
+    setPaymentStage("scan");
+
+    if (!realtimeDb || !isCanteenScanner) {
+      setError("Firebase is not configured yet.");
+      setStatus("Unable to start payment");
+      return;
+    }
 
     try {
       const scannerRef = ref(realtimeDb);
@@ -153,7 +156,6 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
         set(child(scannerRef, `${scannerPath}/Busy`), 0),
         set(child(scannerRef, `${scannerPath}/UID`), 0),
       ]);
-      setPaymentStage("scan");
       setStatus("Please scan your card");
     } catch (amountError) {
       setError(amountError instanceof Error ? amountError.message : "Unable to start payment");
@@ -176,7 +178,10 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
 
   useEffect(() => {
     async function loadStudent() {
-      if (busy !== 1 || !uid || uid === "0" || !firestoreDb || processedUid === uid) {
+      const hasCardUid = Boolean(uid && uid !== "0");
+      const canProcessScan = hasCardUid && (busy === 1 || isCanteenScanner);
+
+      if (!canProcessScan || !firestoreDb || processedUid === uid) {
         return;
       }
 
@@ -384,6 +389,12 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
             >
               Pay Now
             </button>
+          ) : null}
+
+          {paymentStage === "scan" ? (
+            <div className="mt-4 rounded-2xl bg-cyan-50 p-4 text-sm font-black text-teal-800">
+              Payment amount locked: ₹{paymentAmount}
+            </div>
           ) : null}
 
           {paymentResult ? (
