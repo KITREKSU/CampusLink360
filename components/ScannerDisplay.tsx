@@ -35,6 +35,40 @@ function normalizeFeePending(value: unknown) {
   return value === 1 || value === "1" || value === true;
 }
 
+function playSuccessTune() {
+  const AudioContextClass =
+    window.AudioContext ||
+    (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+  if (!AudioContextClass) {
+    return;
+  }
+
+  const audioContext = new AudioContextClass();
+  const notes = [
+    { delay: 0, frequency: 523.25 },
+    { delay: 0.12, frequency: 659.25 },
+    { delay: 0.24, frequency: 783.99 },
+  ];
+
+  notes.forEach((note) => {
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    const startTime = audioContext.currentTime + note.delay;
+
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(note.frequency, startTime);
+    gain.gain.setValueAtTime(0.001, startTime);
+    gain.gain.exponentialRampToValueAtTime(0.22, startTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, startTime + 0.18);
+
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start(startTime);
+    oscillator.stop(startTime + 0.2);
+  });
+}
+
 export function ScannerDisplay({ scanner, description, databasePath }: ScannerDisplayProps) {
   const isCanteenScanner = scanner === "Canteen";
   const [busy, setBusy] = useState<number>(0);
@@ -43,6 +77,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
   const [amount, setAmount] = useState("");
   const [paymentStage, setPaymentStage] = useState<"amount" | "scan">("amount");
   const [paymentResult, setPaymentResult] = useState<PaymentResult | null>(null);
+  const [showSuccessPopup, setShowSuccessPopup] = useState(false);
   const [processedUid, setProcessedUid] = useState("");
   const [status, setStatus] = useState("Waiting for scan");
   const [isLoadingStudent, setIsLoadingStudent] = useState(false);
@@ -58,6 +93,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
     setBusy(0);
     setPaymentStage("amount");
     setPaymentResult(null);
+    setShowSuccessPopup(false);
     setProcessedUid("");
     setError("");
     setStatus(isCanteenScanner ? "Enter amount and tap Pay Now" : "Waiting for scan");
@@ -128,6 +164,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
   async function updateCanteenAmount(nextAmount: string) {
     setAmount(nextAmount);
     setPaymentResult(null);
+    setShowSuccessPopup(false);
     setStudent(null);
     setProcessedUid("");
     setStatus("Enter amount and tap Pay Now");
@@ -260,6 +297,8 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
           setStatus(transactionResult.payment.message);
 
           if (transactionResult.payment.status === "success") {
+            playSuccessTune();
+            setShowSuccessPopup(true);
             preserveNextIdleState.current = true;
             await resetScannerValues();
             setPaymentStage("amount");
@@ -315,6 +354,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
       await resetScannerValues();
       setStudent(null);
       setPaymentResult(null);
+      setShowSuccessPopup(false);
       setProcessedUid("");
       setPaymentStage("amount");
       setAmount("");
@@ -336,6 +376,7 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
       await resetScannerValues();
       setStudent(null);
       setPaymentResult(null);
+      setShowSuccessPopup(false);
       setProcessedUid("");
       setPaymentStage("amount");
       setAmount("");
@@ -517,6 +558,30 @@ export function ScannerDisplay({ scanner, description, databasePath }: ScannerDi
           </button>
         </div>
       </section>
+      ) : null}
+
+      {isCanteenScanner && paymentResult?.status === "success" && showSuccessPopup ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 px-5 backdrop-blur-sm">
+          <section className="w-full max-w-[360px] rounded-[30px] bg-white p-6 text-center shadow-2xl shadow-sky-950/30">
+            <div className="mx-auto grid h-20 w-20 place-items-center rounded-full bg-emerald-50 text-emerald-600">
+              <CheckCircle2 size={42} strokeWidth={2.6} />
+            </div>
+            <h2 className="mt-5 text-2xl font-black text-slate-950">Payment Success</h2>
+            <p className="mt-2 text-sm font-semibold text-slate-500">
+              ₹{paymentResult.amount} deducted from wallet.
+            </p>
+            <p className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-black text-emerald-800">
+              Balance: ₹{paymentResult.balance}
+            </p>
+            <button
+              type="button"
+              onClick={() => setShowSuccessPopup(false)}
+              className="mt-5 h-12 w-full rounded-2xl bg-sky-950 text-sm font-black text-white shadow-lg shadow-sky-950/20"
+            >
+              OK
+            </button>
+          </section>
+        </div>
       ) : null}
     </PageContainer>
   );
