@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, CheckCircle2, Loader2, RotateCcw, ScanLine, WifiOff } from "lucide-react";
 import { child, onValue, ref, set } from "firebase/database";
-import { doc, getDoc } from "firebase/firestore";
+import { doc, getDoc, runTransaction } from "firebase/firestore";
 import { AppHeader } from "@/components/AppHeader";
 import { PageContainer } from "@/components/PageContainer";
 import { firestoreDb, isFirebaseConfigured, realtimeDb } from "@/lib/firebase";
@@ -15,6 +15,14 @@ type StudentDetails = {
   department: string;
   year: string;
   feePending: boolean;
+  wallet: number;
+};
+
+type PaymentResult = {
+  status: "success" | "insufficient";
+  message: string;
+  amount: number;
+  balance: number;
 };
 
 type ScannerDisplayProps = {
@@ -27,20 +35,28 @@ function normalizeFeePending(value: unknown) {
 }
 
 export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
+  const isCanteenScanner = scanner === "Canteen";
   const [busy, setBusy] = useState<number>(0);
   const [uid, setUid] = useState<string>("0");
   const [student, setStudent] = useState<StudentDetails | null>(null);
+  const [amount, setAmount] = useState("");
+  const [paymentResult, setPaymentResult] = useState<PaymentResult | null>(null);
+  const [processedUid, setProcessedUid] = useState("");
   const [status, setStatus] = useState("Waiting for scan");
   const [isLoadingStudent, setIsLoadingStudent] = useState(false);
   const [error, setError] = useState("");
   const scannerPath = useMemo(() => `Scanner/${scanner}`, [scanner]);
+  const paymentAmount = Number(amount);
+  const hasValidAmount = Number.isFinite(paymentAmount) && paymentAmount > 0;
 
   useEffect(() => {
     setStudent(null);
     setUid("0");
     setBusy(0);
+    setPaymentResult(null);
+    setProcessedUid("");
     setError("");
-    setStatus("Waiting for scan");
+    setStatus(isCanteenScanner ? "Enter amount, then scan card" : "Waiting for scan");
 
     if (!realtimeDb || !isFirebaseConfigured) {
       setError("Firebase is not configured yet. Add your project values to .env.local and restart localhost.");
@@ -61,11 +77,18 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
 
         if (currentBusy === 0) {
           setStudent(null);
-          setStatus("Please scan your card");
+          setPaymentResult(null);
+          setProcessedUid("");
+          setStatus(isCanteenScanner ? "Enter amount, then scan card" : "Please scan your card");
           return;
         }
 
         if (currentBusy === 1 && currentUid && currentUid !== "0") {
+          if (isCanteenScanner && !hasValidAmount) {
+            setStatus("Enter amount before scanning card");
+            return;
+          }
+
           setStatus("Card detected. Reading student details...");
           return;
         }
@@ -79,11 +102,18 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     );
 
     return () => unsubscribe();
-  }, [scannerPath]);
+  }, [hasValidAmount, isCanteenScanner, scannerPath]);
 
   useEffect(() => {
     async function loadStudent() {
-      if (busy !== 1 || !uid || uid === "0" || !firestoreDb) {
+      if (busy !== 1 || !uid || uid === "0" || !firestoreDb || processedUid === uid) {
+        return;
+      }
+
+      if (isCanteenScanner && !hasValidAmount) {
+        setStudent(null);
+        setPaymentResult(null);
+        setStatus("Enter amount before scanning card");
         return;
       }
 
@@ -91,7 +121,65 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
       setError("");
 
       try {
-        const studentSnapshot = await getDoc(doc(firestoreDb, "Student", uid));
+        const studentRef = doc(firestoreDb, "Student", uid);
+
+        if (isCanteenScanner) {
+          const transactionResult = await runTransaction(firestoreDb, async (transaction) => {
+            const studentSnapshot = await transaction.get(studentRef);
+
+            if (!studentSnapshot.exists()) {
+              throw new Error(`No student record found for UID ${uid}`);
+            }
+
+            const data = studentSnapshot.data();
+            const currentWallet = Number(data.Wallet ?? 0);
+
+            if (!Number.isFinite(currentWallet)) {
+              throw new Error("Wallet balance is not a valid number");
+            }
+
+            const details: StudentDetails = {
+              name: String(data.Name ?? "Not available"),
+              department: String(data.Department ?? "Not available"),
+              year: String(data.Year ?? "Not available"),
+              feePending: normalizeFeePending(data.FeePending),
+              wallet: currentWallet,
+            };
+
+            if (currentWallet < paymentAmount) {
+              return {
+                student: details,
+                payment: {
+                  status: "insufficient" as const,
+                  message: "Insufficient wallet balance",
+                  amount: paymentAmount,
+                  balance: currentWallet,
+                },
+              };
+            }
+
+            const newWalletBalance = currentWallet - paymentAmount;
+            transaction.update(studentRef, { Wallet: newWalletBalance });
+
+            return {
+              student: { ...details, wallet: newWalletBalance },
+              payment: {
+                status: "success" as const,
+                message: "Payment successful",
+                amount: paymentAmount,
+                balance: newWalletBalance,
+              },
+            };
+          });
+
+          setStudent(transactionResult.student);
+          setPaymentResult(transactionResult.payment);
+          setProcessedUid(uid);
+          setStatus(transactionResult.payment.message);
+          return;
+        }
+
+        const studentSnapshot = await getDoc(studentRef);
 
         if (!studentSnapshot.exists()) {
           setStudent(null);
@@ -105,10 +193,13 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
           department: String(data.Department ?? "Not available"),
           year: String(data.Year ?? "Not available"),
           feePending: normalizeFeePending(data.FeePending),
+          wallet: Number(data.Wallet ?? 0),
         });
+        setProcessedUid(uid);
         setStatus("Student details loaded");
       } catch (studentError) {
         setStudent(null);
+        setPaymentResult(null);
         setError(studentError instanceof Error ? studentError.message : "Unable to read student details");
         setStatus("Unable to load student details");
       } finally {
@@ -117,7 +208,7 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
     }
 
     loadStudent();
-  }, [busy, uid]);
+  }, [busy, hasValidAmount, isCanteenScanner, paymentAmount, processedUid, uid]);
 
   async function clearScanner() {
     if (!realtimeDb) {
@@ -132,9 +223,11 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
       const scannerRef = ref(realtimeDb);
       await Promise.all([set(child(scannerRef, `${scannerPath}/Busy`), 0), set(child(scannerRef, `${scannerPath}/UID`), 0)]);
       setStudent(null);
+      setPaymentResult(null);
+      setProcessedUid("");
       setUid("0");
       setBusy(0);
-      setStatus("Please scan your card");
+      setStatus(isCanteenScanner ? "Enter amount, then scan card" : "Please scan your card");
     } catch (clearError) {
       setError(clearError instanceof Error ? clearError.message : "Unable to clear scanner");
       setStatus("Clear failed");
@@ -152,6 +245,34 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
         <h1 className="mt-5 text-3xl font-black leading-tight">{scanner} Scanner</h1>
         <p className="mt-3 text-sm leading-6 text-cyan-50">{description}</p>
       </section>
+
+      {isCanteenScanner ? (
+        <section className="glass-panel mt-5 rounded-[28px] p-5">
+          <label className="block">
+            <span className="text-xs font-bold uppercase tracking-wide text-teal-700">Payment Amount</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={amount}
+              onChange={(event) => {
+                setAmount(event.target.value);
+                setPaymentResult(null);
+                setStudent(null);
+                setProcessedUid("");
+                setStatus("Enter amount, then scan card");
+              }}
+              disabled={busy === 1}
+              placeholder="Enter amount"
+              className="mt-2 h-12 w-full rounded-2xl border border-cyan-100 bg-white px-4 text-lg font-black text-slate-950 outline-none focus:border-teal-400 disabled:bg-slate-100 disabled:text-slate-500"
+            />
+          </label>
+          <p className="mt-3 text-xs font-semibold leading-5 text-slate-500">
+            Enter the canteen bill amount first. After the card scan, the amount will be deducted from
+            Student/{uid && uid !== "0" ? uid : "UID"}/Wallet.
+          </p>
+        </section>
+      ) : null}
 
       <section className="glass-panel mt-5 rounded-[28px] p-5">
         <div className="flex items-center justify-between gap-3">
@@ -189,17 +310,32 @@ export function ScannerDisplay({ scanner, description }: ScannerDisplayProps) {
                 <DisplayRow label="Name" value={student.name} />
                 <DisplayRow label="Department" value={student.department} />
                 <DisplayRow label="Year" value={student.year} />
+                {isCanteenScanner ? <DisplayRow label="Wallet" value={`₹${student.wallet}`} /> : null}
               </div>
             ) : (
               <div className="py-5 text-center">
-                <p className="text-2xl font-black">Please scan your card</p>
+                <p className="text-2xl font-black">{isCanteenScanner && !hasValidAmount ? "Enter amount first" : "Please scan your card"}</p>
                 <p className="mt-2 text-sm font-semibold text-cyan-100">Waiting at {scannerPath}</p>
               </div>
             )}
           </div>
         </div>
 
-        {student ? (
+        {paymentResult ? (
+          <div
+            className={`mt-4 flex items-start gap-3 rounded-2xl p-4 ${
+              paymentResult.status === "success" ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"
+            }`}
+          >
+            {paymentResult.status === "success" ? <CheckCircle2 size={20} /> : <AlertTriangle size={20} />}
+            <div>
+              <p className="text-sm font-black">{paymentResult.message}</p>
+              <p className="mt-1 text-xs font-semibold opacity-80">
+                Amount: ₹{paymentResult.amount} · Wallet balance: ₹{paymentResult.balance}
+              </p>
+            </div>
+          </div>
+        ) : student && !isCanteenScanner ? (
           <div
             className={`mt-4 flex items-start gap-3 rounded-2xl p-4 ${
               student.feePending ? "bg-amber-50 text-amber-800" : "bg-emerald-50 text-emerald-800"
